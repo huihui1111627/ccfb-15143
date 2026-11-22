@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>mvdisk 虚拟磁盘镜像检视</title>
+<style>
+  :root {
+    --bg:#0f1420; --panel:#171e2e; --line:#26304a; --fg:#d7deee; --dim:#8b96b0;
+    --ok:#3fb96b; --warn:#e0a13a; --bad:#e05a5a; --accent:#5b8def; --zero:#8a63d2;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",monospace; }
+  header { padding:18px 24px; border-bottom:1px solid var(--line);
+    display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  .badge { padding:2px 10px; border-radius:12px; font-size:12px; border:1px solid var(--line); }
+  .badge.dirty { color:var(--warn); border-color:var(--warn); }
+  .badge.ro { color:var(--dim); }
+  main { padding:24px; display:grid; gap:20px; max-width:1280px; margin:0 auto; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px 20px; }
+  section h2 { margin:0 0 14px; font-size:15px; color:var(--accent); }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th,td { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--dim); font-weight:600; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .bar { height:10px; background:#0c111d; border-radius:6px; overflow:hidden; display:flex; }
+  .bar i { display:block; height:100%; }
+  .bar .valid { background:var(--ok); } .bar .zero { background:var(--zero); }
+  .bar .hole { background:#2a3350; }
+  .role-L1,.role-refL1 { color:var(--accent); }
+  .role-L2,.role-refL2 { color:var(--zero); }
+  .role-data { color:var(--ok); }
+  .role-unknown { color:var(--bad); }
+  .refs0 { color:var(--warn); }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px;
+    padding:8px 18px; cursor:pointer; font-size:13px; }
+  button.secondary { background:#2a3550; }
+  button:disabled { opacity:.5; cursor:default; }
+  .issue { padding:8px 12px; border-radius:8px; margin-bottom:6px; border:1px solid var(--line); }
+  .issue.corruption { border-color:var(--bad); color:#ffb4b4; }
+  .issue.leak { border-color:var(--warn); color:#f3cf8f; }
+  .issue.refcount-under,.issue.refcount-over { border-color:var(--zero); color:#cbb6f0; }
+  .muted { color:var(--dim); }
+  .scroll { max-height:340px; overflow:auto; }
+  .chain { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .chain .node { border:1px solid var(--line); border-radius:8px; padding:8px 14px; background:#0c111d; }
+  .chain .arrow { color:var(--dim); }
+  code { color:#a9c7ff; }
+  .kv { display:grid; grid-template-columns:max-content 1fr; gap:4px 18px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>mvdisk 虚拟磁盘镜像检视</h1>
+  <span id="state"></span>
+  <span style="flex:1"></span>
+  <button class="secondary" onclick="loadAll()">刷新</button>
+  <button class="secondary" onclick="runCheck()">检查</button>
+  <button onclick="runRepair()">修复</button>
+</header>
+<main>
+  <section>
+    <h2>① 镜像链</h2>
+    <div id="chain" class="chain"></div>
+    <div id="meta" class="kv" style="margin-top:14px"></div>
+  </section>
+
+  <section>
+    <h2>② 两级映射表占用情况</h2>
+    <div class="grid2">
+      <div>
+        <h3 class="muted" style="font-size:13px">数据映射 L1 → L2</h3>
+        <div id="l1"></div>
+        <div class="bar" id="l2bar" style="margin-top:10px"></div>
+        <div class="muted" style="margin-top:6px" id="l2legend"></div>
+      </div>
+      <div>
+        <h3 class="muted" style="font-size:13px">引用计数表 refL1 → refL2</h3>
+        <div id="refl1"></div>
+      </div>
+    </div>
+    <div class="scroll" style="margin-top:14px">
+      <table id="l2table">
+        <thead><tr><th>L2 物理簇</th><th>负责虚拟簇起</th><th>有效项</th><th>零标记</th><th>空洞项</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>③ 每个物理簇的引用计数</h2>
+    <div class="scroll">
+      <table id="reftable">
+        <thead><tr><th>物理簇</th><th>角色</th><th>引用计数</th><th>状态</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>④ 检查 / 修复报告</h2>
+    <div id="report" class="muted">尚未运行检查。</div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+async function getJSON(u, opt){
+  const r = await fetch(u, opt);
+  return r.json();
+}
+function pct(a,b){ return b ? (100*a/b).toFixed(1)+"%" : "0%"; }
+function bytes(n){
+  const u=["B","KiB","MiB","GiB","TiB"]; let i=0;
+  while(n>=1024 && i<u.length-1){ n/=1024; i++; }
+  return n.toFixed(n<10&&i>0?2:0)+" "+u[i];
+}
+async function loadAll(){
+  const [insp, chain, stats] = await Promise.all([
+    getJSON("/api/inspect"), getJSON("/api/chain"), getJSON("/api/stats")]);
+  renderState(insp); renderChain(chain.chain, insp); renderMeta(insp, stats);
+  renderTables(insp); renderRefs(insp);
+}
+function renderState(d){
+  const tags=[];
+  tags.push(d.dirty?'<span class="badge dirty">脏（未正常关闭）</span>':'<span class="badge">干净</span>');
+  if(d.readOnly) tags.push('<span class="badge ro">只读</span>');
+  $("#state").innerHTML = tags.join(" ");
+}
+function renderChain(chain, insp){
+  $("#chain").innerHTML = chain.map((n,i)=>
+    `<div class="node">${i===chain.length-1?'<b>顶层</b> ':'底包 '}
+       <code>${n.path}</code>
+       <div class="muted" style="font-size:12px">底包路径: ${n.basePath||"（无）"} ${n.readOnly?"· 只读":""} ${n.dirty?"· 脏":""}</div>
+     </div>`).join('<span class="arrow">→</span>');
+}
+function renderMeta(d, st){
+  $("#meta").innerHTML = `
+    <span class="muted">簇大小</span><span>${d.clusterSize} 字节</span>
+    <span class="muted">虚拟盘大小</span><span>${bytes(d.virtualSize)}（${d.virtualSize/d.clusterSize} 簇）</span>
+    <span class="muted">镜像文件大小</span><span>${bytes(d.fileBytes)}（高水位 ${d.highWater}/${d.maxClusters} 簇）</span>
+    <span class="muted">数据簇 / 零标记虚拟簇 / 泄漏簇</span>
+      <span>${d.dataClusters} / ${d.zeroMarkedVirtualClusters} / <b style="color:var(--warn)">${d.leakedClusters}</b></span>
+    <span class="muted">读放大 / 写放大</span>
+      <span>${st.readAmp.toFixed(2)} / ${st.writeAmp.toFixed(2)}（逻辑写 ${bytes(st.logicalWriteBytes)}，物理写 ${bytes(st.physicalWriteBytes)}，Sync ${st.syncCount} 次）</span>`;
+}
+function renderTables(d){
+  $("#l1").innerHTML = `
+    <table><tr><th>L1 根表簇数</th><td>${d.l1.clusters}</td></tr>
+    <tr><th>已分配 L2 的项</th><td>${d.l1.allocatedL2} / ${d.l1.totalEntries}</td></tr></table>`;
+  $("#refl1").innerHTML = `
+    <table><tr><th>refL1 根表簇数</th><td>${d.refL1.clusters}</td></tr>
+    <tr><th>已分配 refL2 的项</th><td>${d.refL1.allocatedRefL2} / ${d.refL1.maxClusters}</td></tr></table>`;
+  let v=0,z=0,h=0;
+  $("#l2table tbody").innerHTML = d.l2Tables.map(t=>{
+    v+=t.validEntries; z+=t.zeroEntries; h+=t.holeEntries;
+    return `<tr><td class="role-L2">${t.physCluster}</td><td>${t.virtualCluster}</td>
+      <td>${t.validEntries}</td><td style="color:var(--zero)">${t.zeroEntries}</td><td class="muted">${t.holeEntries}</td></tr>`;
+  }).join("") || '<tr><td colspan="5" class="muted">尚未分配任何 L2 表</td></tr>';
+  const tot=v+z+h || 1;
+  $("#l2bar").innerHTML =
+    `<i class="valid" style="width:${100*v/tot}%"></i>
+     <i class="zero" style="width:${100*z/tot}%"></i>
+     <i class="hole" style="width:${100*h/tot}%"></i>`;
+  $("#l2legend").innerHTML =
+    `<span style="color:var(--ok)">■ 有效映射 ${v}（${pct(v,tot)}）</span> ·
+     <span style="color:var(--zero)">■ 全零标记 ${z}（${pct(z,tot)}）</span> ·
+     <span class="muted">■ 空洞下沉底包 ${h}（${pct(h,tot)}）</span>`;
+}
+function renderRefs(d){
+  $("#reftable tbody").innerHTML = d.clusterRefs.map(c=>
+    `<tr><td>${c.cluster}</td><td class="role-${c.role}">${c.role}</td>
+     <td class="${c.refs===0?'refs0':''}">${c.refs}</td>
+     <td>${c.free?'<span class="badge ro">空闲可复用</span>':(c.refs===0?'<span class="badge dirty">泄漏</span>':'在用')}</td></tr>`
+  ).join("");
+}
+async function runCheck(){
+  const r = await getJSON("/api/check");
+  renderReport(r, "检查完成");
+}
+async function runRepair(){
+  if(!confirm("将对顶层镜像执行修复（回收泄漏簇、修正引用计数），继续？")) return;
+  const r = await getJSON("/api/repair", {method:"POST"});
+  renderReport(r, "修复完成");
+  loadAll();
+}
+function kindName(k){
+  return {corruption:"结构损坏",leak:"泄漏",["refcount-under"]:"引用计数偏小",["refcount-over"]:"引用计数偏大"}[k]||k;
+}
+function renderReport(r, title){
+  const box = $("#report");
+  if(r.error){ box.innerHTML = `<div class="issue corruption"><b>无法完全修复：</b>${r.error}</div>`; return; }
+  if(!r.issues || r.issues.length===0){
+    box.innerHTML = `<div class="muted">${title}：<b style="color:var(--ok)">报告干净，未发现问题。</b></div>`;
+    if(r.actions && r.actions.length){
+      box.innerHTML += r.actions.map(a=>`<div class="issue leak">${a.detail}</div>`).join("");
+    }
+    return;
+  }
+  const counts = {};
+  r.issues.forEach(i=>counts[i.kind]=(counts[i.kind]||0)+1);
+  let html = `<div>共发现 ${r.issues.length} 个问题：` +
+    Object.entries(counts).map(([k,n])=>`${kindName(k)} ${n}`).join("，") + `</div>`;
+  html += r.issues.map(i=>`<div class="issue ${i.kind}"><b>${kindName(i.kind)}</b>（簇 ${i.cluster}）：${i.detail}</div>`).join("");
+  box.innerHTML = html;
+}
+loadAll();
+</script>
+</body>
+</html>
