@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>学习型索引可视化 · Learned Index</title>
+<style>
+  :root { --bg:#0f1420; --panel:#171e2e; --line:#2a3550; --txt:#dbe4f5; --dim:#8494b3;
+          --accent:#5ab0ff; --seg:#ff7a59; --cdf:#7ee0a3; --err:#ffd166; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",monospace; }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex;
+           align-items:center; gap:18px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; font-weight:600; }
+  select,input,button { background:var(--panel); color:var(--txt); border:1px solid var(--line);
+           border-radius:6px; padding:6px 10px; font-size:13px; }
+  button { cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:16px 24px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card h2 { font-size:14px; margin:0 0 10px; color:var(--accent); font-weight:600; }
+  .full { grid-column:1 / -1; }
+  canvas { width:100%; display:block; }
+  .stat { display:inline-block; margin-right:18px; color:var(--dim); }
+  .stat b { color:var(--txt); }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { padding:5px 8px; border-bottom:1px solid var(--line); text-align:right; }
+  th:first-child,td:first-child { text-align:left; }
+  .trace-step { background:#10182a; border:1px solid var(--line); border-radius:8px;
+                padding:10px 12px; margin-bottom:8px; font-size:12.5px; }
+  .trace-step .lv { color:var(--accent); font-weight:600; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; background:#22304d;
+          color:var(--accent); font-size:11px; margin-left:6px; }
+  .legend span { margin-right:16px; font-size:12px; color:var(--dim); }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:middle; }
+</style>
+</head>
+<body>
+<header>
+  <h1>学习型索引（Learned / PGM 风格）可视化</h1>
+  <label>分布
+    <select id="profile">
+      <option value="timestamps">交易时间戳</option>
+      <option value="uniform">用户编号·均匀</option>
+      <option value="zipf">用户编号·Zipf</option>
+      <option value="geo">地理编码·Morton</option>
+    </select>
+  </label>
+  <label>误差上限 eps
+    <select id="eps">
+      <option>4</option><option selected>16</option><option>64</option><option>256</option>
+    </select>
+  </label>
+  <label>点查键 <input id="key" size="16" placeholder="输入 int64 键"></label>
+  <button id="traceBtn">追踪查找</button>
+  <button id="randomBtn">随机键</button>
+</header>
+
+<div class="grid">
+  <div class="card">
+    <h2>键密度分布（仿真数据直方图）</h2>
+    <div id="distStat" class="stat"></div>
+    <canvas id="distCanvas" height="260"></canvas>
+  </div>
+  <div class="card">
+    <h2>每段最大误差</h2>
+    <canvas id="errCanvas" height="260"></canvas>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--err)"></i>段最大预测误差（均 ≤ eps）</span>
+    </div>
+  </div>
+
+  <div class="card full">
+    <h2>CDF 拟合：真实键→位置（绿）与分段线性模型（橙）</h2>
+    <div id="segStat"></div>
+    <canvas id="cdfCanvas" height="340"></canvas>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--cdf)"></i>真实 CDF 抽样点</span>
+      <span><i class="dot" style="background:var(--seg)"></i>PLA 分段直线</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>一次点查的逐层预测过程</h2>
+    <div id="trace"></div>
+  </div>
+  <div class="card">
+    <h2>分段明细（前 25 段）</h2>
+    <table id="segTable"><thead><tr>
+      <th>段</th><th>首键</th><th>末键</th><th>点数</th><th>斜率</th><th>截距</th><th>最大误差</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+async function getJSON(url){ const r = await fetch(url); if(!r.ok) throw new Error(url); return r.json(); }
+function fitCanvas(cv){ const dpr = window.devicePixelRatio||1; const w = cv.clientWidth;
+  cv.width = w*dpr; cv.height = cv.height*dpr; const ctx = cv.getContext('2d'); ctx.scale(dpr,dpr);
+  return {ctx, w, h: cv.height/dpr}; }
+
+async function loadAll(){
+  const p = $('profile').value, eps = $('eps').value;
+  const [dist, seg] = await Promise.all([
+    getJSON(`/api/distribution?profile=${p}&buckets=120`),
+    getJSON(`/api/segments?profile=${p}&eps=${eps}`),
+  ]);
+  drawDist(dist); drawErr(seg); drawCDF(seg); fillTable(seg);
+  window.__seg = seg;
+}
+
+function drawDist(d){
+  const {ctx,w,h} = fitCanvas($('distCanvas'));
+  ctx.clearRect(0,0,w,h);
+  const max = Math.max(...d.buckets.map(b=>b.count));
+  const bw = w / d.buckets.length;
+  ctx.fillStyle = '#5ab0ff';
+  d.buckets.forEach((b,i)=>{
+    const bh = (b.count/max)*(h-24);
+    ctx.fillRect(i*bw+1, h-bh-18, Math.max(1,bw-2), bh);
+  });
+  $('distStat').innerHTML =
+    `<span class="stat">样本 <b>${d.n.toLocaleString()}</b></span>`+
+    `<span class="stat">不同键 <b>${d.unique.toLocaleString()}</b></span>`+
+    `<span class="stat">重复占比 <b>${(d.dupRatio*100).toFixed(2)}%</b></span>`;
+}
+
+function drawErr(seg){
+  const {ctx,w,h} = fitCanvas($('errCanvas'));
+  ctx.clearRect(0,0,w,h);
+  const segs = seg.segments;
+  const bw = w / segs.length;
+  const max = Math.max(seg.eps, ...segs.map(s=>s.maxErr));
+  ctx.fillStyle = '#ffd166';
+  segs.forEach((s,i)=>{
+    const bh = (s.maxErr/max)*(h-20);
+    ctx.fillRect(i*bw, h-bh-14, Math.max(1,bw-1), bh);
+  });
+  // eps 参考线
+  const y = h - (seg.eps/max)*(h-20) - 14;
+  ctx.strokeStyle = '#ff5a5a'; ctx.setLineDash([5,4]);
+  ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = '#ff5a5a'; ctx.fillText('eps='+seg.eps, 6, y-4);
+}
+
+function drawCDF(seg){
+  const {ctx,w,h} = fitCanvas($('cdfCanvas'));
+  ctx.clearRect(0,0,w,h);
+  const xs = seg.cdf.map(p=>p.x), ys = seg.cdf.map(p=>p.y);
+  const xmin=Math.min(...xs), xmax=Math.max(...xs), ymax=Math.max(...ys);
+  const X = x => 8 + (x-xmin)/(xmax-xmin||1)*(w-16);
+  const Y = y => h-10 - (y/ymax)*(h-24);
+  // 真实 CDF 点
+  ctx.fillStyle = '#7ee0a3';
+  seg.cdf.forEach(p=>{ ctx.fillRect(X(p.x)-1, Y(p.y)-1, 2.5, 2.5); });
+  // 分段直线：每段从 First->Last 画模型线
+  ctx.strokeStyle = '#ff7a59'; ctx.lineWidth = 1.4;
+  seg.segments.forEach(s=>{
+    ctx.beginPath();
+    ctx.moveTo(X(s.first), Y(s.slope*s.first+s.intercept));
+    ctx.lineTo(X(s.last),  Y(s.slope*s.last+s.intercept));
+    ctx.stroke();
+  });
+  ctx.lineWidth = 1;
+  $('segStat').innerHTML =
+    `<span class="stat">层数 <b>${seg.layers.join(' → ')}</b></span>`+
+    `<span class="stat">叶子段数 <b>${seg.segments.length.toLocaleString()}</b></span>`+
+    `<span class="stat">索引内存 <b>${(seg.indexBytes/1024).toFixed(1)} KB</b></span>`+
+    `<span class="stat">平均误差 <b>${seg.avgErr.toFixed(3)}</b></span>`+
+    `<span class="stat">eps <b>${seg.eps}</b></span>`;
+}
+
+function fillTable(seg){
+  const tb = $('segTable').querySelector('tbody');
+  tb.innerHTML = '';
+  seg.segments.slice(0,25).forEach((s,i)=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${i}</td><td>${s.first}</td><td>${s.last}</td><td>${s.points}</td>`+
+                   `<td>${s.slope.toExponential(3)}</td><td>${s.intercept.toFixed(1)}</td>`+
+                   `<td>${s.maxErr.toFixed(2)}</td>`;
+    tb.appendChild(tr);
+  });
+}
+
+async function doTrace(){
+  const p = $('profile').value, eps = $('eps').value;
+  const key = $('key').value.trim();
+  if(!key) return;
+  const t = await getJSON(`/api/trace?profile=${p}&eps=${eps}&key=${encodeURIComponent(key)}`);
+  const box = $('trace'); box.innerHTML = '';
+  t.steps.forEach(st=>{
+    const div = document.createElement('div'); div.className='trace-step';
+    div.innerHTML = `<span class="lv">第 ${st.layer} 层</span>`+
+      `<span class="pill">段 #${st.segmentIndex}</span>`+
+      `<div>模型 pred = ${st.slope.toExponential(4)}·x + ${st.intercept.toFixed(2)}</div>`+
+      `<div>预测位置 <b>${st.predicted.toFixed(2)}</b> → 二分窗口 `+
+      `[${st.windowLo}, ${st.windowHi}]（${st.windowHi-st.windowLo+1} 个元素）→ 选中下标 <b>${st.chosen}</b></div>`;
+    box.appendChild(div);
+  });
+  const r = t.result;
+  const sum = document.createElement('div'); sum.className='trace-step';
+  sum.innerHTML = `<span class="lv">叶子数据层结果</span>`+
+    `<div>键 ${key}：<b>${r.found?'命中':'不存在（返回插入点）'}</b>，位置 <b>${r.position}</b></div>`+
+    `<div>实际搜索范围 <b>${r.examined}</b> 个元素，上层路由检查 ${r.routeExamined} 个，`+
+    `共 ${r.layers} 层${r.fellBack?'，触发全量回退':''}</div>`;
+  box.appendChild(sum);
+}
+
+$('profile').onchange = loadAll; $('eps').onchange = loadAll;
+$('traceBtn').onclick = doTrace;
+$('randomBtn').onclick = async ()=>{
+  const p = $('profile').value;
+  const d = await getJSON(`/api/distribution?profile=${p}&buckets=120`);
+  // 在键域内取一个随机键，一半概率取真实键
+  const useReal = Math.random()<0.5;
+  $('key').value = useReal ? d.buckets[Math.floor(Math.random()*d.buckets.length)].x|0
+                            : (d.min + Math.random()*(d.max-d.min))|0;
+  doTrace();
+};
+loadAll();
+</script>
+</body>
+</html>
